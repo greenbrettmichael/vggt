@@ -8,6 +8,18 @@ import torch
 import numpy as np
 from .vggsfm_utils import *
 
+def print_torch_cuda_mem(dev_id: int = 0):
+    torch.cuda.set_device(dev_id)
+    free, total = torch.cuda.mem_get_info()       # driver-level snapshot
+    used = total - free
+
+    print(f"GPU {dev_id} — {torch.cuda.get_device_name(dev_id)}")
+    print(f"  total device RAM   : {total / 2**30:.2f} GiB")
+    print(f"  free  device RAM   : {free  / 2**30:.2f} GiB")
+    print(f"  used  device RAM   : {used  / 2**30:.2f} GiB")
+    print(f"  └─ allocated by tensors  : {torch.cuda.memory_allocated(dev_id) / 2**30:.2f} GiB")
+    print(f"     reserved by allocator : {torch.cuda.memory_reserved(dev_id) / 2**30:.2f} GiB")
+
 
 def predict_tracks(
     images,
@@ -17,7 +29,7 @@ def predict_tracks(
     max_query_pts=2048,
     query_frame_num=5,
     keypoint_extractor="aliked+sp",
-    max_points_num=163840,
+    max_points_num=40960,
     fine_tracking=True,
     complete_non_vis=True,
 ):
@@ -54,9 +66,13 @@ def predict_tracks(
     device = images.device
     dtype = images.dtype
     tracker = build_vggsfm_tracker().to(device, dtype)
+    print(f"Using VGG-SFM tracker on device {device} with dtype {dtype}")
+    print_torch_cuda_mem()
 
     # Find query frames
     query_frame_indexes = generate_rank_by_dino(images, query_frame_num=query_frame_num, device=device)
+    print(f"Query frames selected: {query_frame_indexes}")
+    print_torch_cuda_mem()
 
     # Add the first image to the front if not already present
     if 0 in query_frame_indexes:
@@ -216,6 +232,9 @@ def _forward_on_query(
         query_points = torch.chunk(query_points, num_splits, dim=1)
     else:
         query_points = [query_points]
+
+    print("before predict_tracks_in_chunks:")
+    print_torch_cuda_mem()
 
     pred_track, pred_vis, _ = predict_tracks_in_chunks(
         tracker, images_feed, query_points, fmaps_feed, fine_tracking=fine_tracking

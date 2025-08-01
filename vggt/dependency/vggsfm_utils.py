@@ -251,6 +251,17 @@ def extract_keypoints(query_image, extractors, round_keypoints=True):
 
     return query_points
 
+def print_torch_cuda_mem(dev_id: int = 0):
+    torch.cuda.set_device(dev_id)
+    free, total = torch.cuda.mem_get_info()       # driver-level snapshot
+    used = total - free
+
+    print(f"GPU {dev_id} — {torch.cuda.get_device_name(dev_id)}")
+    print(f"  total device RAM   : {total / 2**30:.2f} GiB")
+    print(f"  free  device RAM   : {free  / 2**30:.2f} GiB")
+    print(f"  used  device RAM   : {used  / 2**30:.2f} GiB")
+    print(f"  └─ allocated by tensors  : {torch.cuda.memory_allocated(dev_id) / 2**30:.2f} GiB")
+    print(f"     reserved by allocator : {torch.cuda.memory_reserved(dev_id) / 2**30:.2f} GiB")
 
 def predict_tracks_in_chunks(
     track_predictor, images_feed, query_points_list, fmaps_feed, fine_tracking, num_splits=None, fine_chunk=40960
@@ -280,6 +291,9 @@ def predict_tracks_in_chunks(
     if isinstance(query_points_list, tuple):
         query_points_list = list(query_points_list)
 
+    print(f"Start predicting tracks in chunks with {len(query_points_list)} splits.")
+    print_torch_cuda_mem()
+
     fine_pred_track_list = []
     pred_vis_list = []
     pred_score_list = []
@@ -292,6 +306,9 @@ def predict_tracks_in_chunks(
         fine_pred_track_list.append(fine_pred_track)
         pred_vis_list.append(pred_vis)
         pred_score_list.append(pred_score)
+    
+    print(f"Finished predicting tracks in chunks. Number of splits: {len(query_points_list)}")
+    print_torch_cuda_mem()
 
     # Concatenate the results from all splits
     fine_pred_track = torch.cat(fine_pred_track_list, dim=2)

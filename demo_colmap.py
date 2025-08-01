@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import gc
+import math
 import random
 import numpy as np
 import glob
@@ -54,7 +56,7 @@ def parse_args():
     parser.add_argument("--query_frame_num", type=int, default=8, help="Number of frames to query")
     parser.add_argument("--max_query_pts", type=int, default=4096, help="Maximum number of query points")
     parser.add_argument(
-        "--fine_tracking", action="store_true", default=True, help="Use fine tracking (slower but more accurate)"
+        "--fine_tracking", action="store_true", default=False, help="Use fine tracking (slower but more accurate)"
     )
     parser.add_argument(
         "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
@@ -62,37 +64,139 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_VGGT(model, images, dtype, resolution=518):
+def run_VGGT(model: VGGT, images, dtype, resolution=518):
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
     assert images.shape[1] == 3
 
     # hard-coded to use 518 for VGGT
+    print(f"Before resizing, images shape: {images.shape}")
+    print_torch_cuda_mem()
     images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+    torch.cuda.empty_cache()
+    print(f"After resizing, images shape: {images.shape}")
+    print_torch_cuda_mem()
 
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
+    with torch.inference_mode():
+        with torch.amp.autocast(device_type="cuda", dtype=dtype):
             images = images[None]  # add batch dimension
             aggregated_tokens_list, ps_idx = model.aggregator(images)
+        print(f"Aggregated tokens")
+        print_torch_cuda_mem()
 
         # Predict Cameras
         pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+        print(f"Pose encoding shape")
+        print_torch_cuda_mem()
         # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+        print(f"Extrinsic shape: {extrinsic.shape}, Intrinsic shape: {intrinsic.shape}")
+        print_torch_cuda_mem()
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+        print(f"Depth map shape: {depth_map.shape}, Depth confidence shape: {depth_conf.shape}")
+        print_torch_cuda_mem()
 
     extrinsic = extrinsic.squeeze(0).cpu().numpy()
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
     depth_map = depth_map.squeeze(0).cpu().numpy()
     depth_conf = depth_conf.squeeze(0).cpu().numpy()
+    print(f"Final extrinsic shape: {extrinsic.shape}, intrinsic shape: {intrinsic.shape}")
+    print_torch_cuda_mem()
+    return extrinsic, intrinsic, depth_map, depth_conf
+
+@torch.no_grad()
+def run_VGGT_batched(
+    model: "VGGT",
+    images: torch.Tensor,          # [F, 3, H, W]  (F = #frames)
+    dtype: torch.dtype = torch.bfloat16,
+    resolution: int = 518,
+    chunk_size: int = 8,           # ← tune this for your card
+):
+    assert images.ndim == 4 and images.shape[1] == 3
+
+    # ------------------------------------------------------------------ #
+    #  Move *nothing* to the GPU yet – resize on CPU to save VRAM first. #
+    # ------------------------------------------------------------------ #
+    images = F.interpolate(
+        images,
+        size=(resolution, resolution),
+        mode="bilinear",
+        align_corners=False,
+    )                               # still on CPU
+    F_cpu, _, H_r, W_r = images.shape
+
+    # containers that live on the *CPU*
+    extrinsics, intrinsics, depth_maps, depth_confs = [], [], [], []
+
+    for start in range(0, F_cpu, chunk_size):
+        end = min(start + chunk_size, F_cpu)
+        imgs_cpu = images[start:end]                    # [f,3,H,W]  (CPU)
+        f = imgs_cpu.shape[0]
+
+        # ------------------------------------------------------------------ #
+        #  Send just this slice to the GPU and add the "scene" batch dim.     #
+        # ------------------------------------------------------------------ #
+        imgs_gpu = imgs_cpu.to(device="cuda", non_blocking=True).unsqueeze(0)
+        # shape = [1, f, 3, H_r, W_r]
+
+        with torch.autocast("cuda", dtype=dtype):
+            agg_tokens, ps_idx = model.aggregator(imgs_gpu)
+
+            pose_enc = model.camera_head(agg_tokens)[-1]
+            extri, intri = pose_encoding_to_extri_intri(pose_enc, (H_r, W_r))
+
+            depth_map, depth_conf = model.depth_head(
+                agg_tokens, imgs_gpu, ps_idx
+            )
+
+        # ------------------------------------------------------------ #
+        #  Move results back to CPU and append to growing lists.       #
+        # ------------------------------------------------------------ #
+        extrinsics .append(extri.squeeze(0).cpu())
+        intrinsics.append(intri.squeeze(0).cpu())
+        depth_maps .append(depth_map.squeeze(0).cpu())
+        depth_confs.append(depth_conf.squeeze(0).cpu())
+
+        # ------------------------------------------------------------ #
+        #  Free everything from this chunk before the next iteration.  #
+        # ------------------------------------------------------------ #
+        del imgs_gpu, agg_tokens, ps_idx, pose_enc, extri, intri
+        del depth_map, depth_conf
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # ------------------------------------------------------------ #
+    #  Concatenate along the frame dimension and return NumPy.     #
+    # ------------------------------------------------------------ #
+    extrinsic = torch.cat(extrinsics,  dim=0).numpy()   # [F, 4, 4]
+    intrinsic = torch.cat(intrinsics, dim=0).numpy()    # [F, 3, 3]
+    depth_map = torch.cat(depth_maps,  dim=0).numpy()   # [F, 1, H_r, W_r]
+    depth_conf= torch.cat(depth_confs, dim=0).numpy()   # [F, 1, H_r, W_r]
+
     return extrinsic, intrinsic, depth_map, depth_conf
 
 
+
+def print_torch_cuda_mem(dev_id: int = 0):
+    torch.cuda.set_device(dev_id)
+    free, total = torch.cuda.mem_get_info()       # driver-level snapshot
+    used = total - free
+
+    print(f"GPU {dev_id} — {torch.cuda.get_device_name(dev_id)}")
+    print(f"  total device RAM   : {total / 2**30:.2f} GiB")
+    print(f"  free  device RAM   : {free  / 2**30:.2f} GiB")
+    print(f"  used  device RAM   : {used  / 2**30:.2f} GiB")
+    print(f"  └─ allocated by tensors  : {torch.cuda.memory_allocated(dev_id) / 2**30:.2f} GiB")
+    print(f"     reserved by allocator : {torch.cuda.memory_reserved(dev_id) / 2**30:.2f} GiB")
+
+
+@torch.inference_mode()
 def demo_fn(args):
     # Print configuration
     print("Arguments:", vars(args))
+    print_torch_cuda_mem()
 
     # Set seed for reproducibility
     np.random.seed(args.seed)
@@ -104,7 +208,8 @@ def demo_fn(args):
     print(f"Setting seed as: {args.seed}")
 
     # Set device and dtype
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    dtype = torch.float16
+    print(f"Using dtype: {dtype} because GPU capability is {torch.cuda.get_device_capability()[0]}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Using dtype: {dtype}")
@@ -116,28 +221,36 @@ def demo_fn(args):
     model.eval()
     model = model.to(device)
     print(f"Model loaded")
+    print_torch_cuda_mem()
 
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
     image_path_list = glob.glob(os.path.join(image_dir, "*"))
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
+    # sort images by name
+    image_path_list.sort()
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates
     # Load Image in 1024, while running VGGT with 518
     vggt_fixed_resolution = 518
-    img_load_resolution = 1024
+    img_load_resolution = 518
 
     images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
-    images = images.to(device)
-    original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir}")
+    print_torch_cuda_mem()
 
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+    max_images = 40
+    chunk_size = math.ceil(len(images) / float(max_images))
+    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT_batched(model, images, dtype, vggt_fixed_resolution, chunk_size=chunk_size)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+    print("ran VGGT")
+    print_torch_cuda_mem()
+
+    images = images.to(device)
 
     if args.use_ba:
         image_size = np.array(images.shape[-2:])
@@ -162,8 +275,12 @@ def demo_fn(args):
                 keypoint_extractor="aliked+sp",
                 fine_tracking=args.fine_tracking,
             )
+            print("ran predict_tracks")
+            print_torch_cuda_mem()
 
             torch.cuda.empty_cache()
+            print("cleared CUDA cache")
+            print_torch_cuda_mem()
 
         # rescale the intrinsic matrix from 518 to 1024
         intrinsic[:, :2, :] *= scale
@@ -176,6 +293,7 @@ def demo_fn(args):
             intrinsic,
             pred_tracks,
             image_size,
+            image_names=base_image_path_list,
             masks=track_mask,
             max_reproj_error=args.max_reproj_error,
             shared_camera=shared_camera,
@@ -188,6 +306,8 @@ def demo_fn(args):
 
         # Bundle Adjustment
         ba_options = pycolmap.BundleAdjustmentOptions()
+        ba_options.refine_rig_from_world = False
+        ba_options.refine_sensor_from_rig = False
         pycolmap.bundle_adjustment(reconstruction, ba_options)
 
         reconstruction_resolution = img_load_resolution
@@ -225,6 +345,7 @@ def demo_fn(args):
             extrinsic,
             intrinsic,
             image_size,
+            image_names=base_image_path_list,
             shared_camera=shared_camera,
             camera_type=camera_type,
         )
@@ -255,19 +376,25 @@ def rename_colmap_recons_and_rescale_camera(
     reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False, shared_camera=False
 ):
     rescale_camera = True
+    sorted_recon_images = sorted(reconstruction.images.keys())
 
-    for pyimageid in reconstruction.images:
+    for i, pyimageid in enumerate(sorted_recon_images):
+        print(f"ID {pyimageid} corresponds to image {i}")
         # Reshaped the padded&resized image to the original size
         # Rename the images to the original names
         pyimage = reconstruction.images[pyimageid]
         pycamera = reconstruction.cameras[pyimage.camera_id]
-        pyimage.name = image_paths[pyimageid - 1]
+
+        is_overlap = i < 3 or i >= len(reconstruction.images) - 3
+        if is_overlap:
+            print(f"Image {pyimage.name} is in the overlap region")
+            pyimage.points2D.clear()
 
         if rescale_camera:
             # Rescale the camera parameters
             pred_params = copy.deepcopy(pycamera.params)
 
-            real_image_size = original_coords[pyimageid - 1, -2:]
+            real_image_size = original_coords[i, -2:]
             resize_ratio = max(real_image_size) / img_size
             pred_params = pred_params * resize_ratio
             real_pp = real_image_size / 2
@@ -279,7 +406,7 @@ def rename_colmap_recons_and_rescale_camera(
 
         if shift_point2d_to_original_res:
             # Also shift the point2D to original resolution
-            top_left = original_coords[pyimageid - 1, :2]
+            top_left = original_coords[i, :2]
 
             for point2D in pyimage.points2D:
                 point2D.xy = (point2D.xy - top_left) * resize_ratio

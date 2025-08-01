@@ -15,7 +15,9 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 
-XFORMERS_AVAILABLE = False
+XFORMERS_AVAILABLE = True
+import xformers
+from xformers.ops import memory_efficient_attention, unbind
 
 
 class Attention(nn.Module):
